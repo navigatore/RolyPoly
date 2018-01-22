@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+message GenericMessage
+{
+    string type = 1;
+    oneof content
+    {
+        int32 port = 2;
+        int64 u_id = 3;
+        Message message = 4;
+        KnownServers known_servers = 5;
+        KnownUsers known_users = 6;
+        ConnectRequest connect_request = 7;
+        NewSystemUserInfo new_system_user_info = 8;
+        Hops hops = 9;
+        UserList userlist = 10;
+    }
+}
+
+message Message
+{
+    int64 sender_id = 1;
+    int64 receiver_id = 2;
+    string text = 3;
+}
+
+message KnownServers
+{
+    repeated Server servers = 1;
+}
+
+message KnownUsers
+{
+    repeated User users = 1;
+}
+
+message Server
+{
+    int64 s_id = 1;
+    int64 last_alive = 2;
+}
+
+message User
+{
+    int64 u_id = 1;
+    string username = 2;
+    int64 s_id = 3;
+    int64 last_alive = 4;
+}
+
+message UserList
+{
+    repeated UserBasic users = 1;
+}
+
+message UserBasic
+{
+    int64 s_id = 1;
+    string username = 2;
+}
+
+message ConnectRequest
+{
+    int64 u_id = 1;
+    string username = 2;
+}
+
+message NewSystemUserInfo
+{
+    int64 u_id = 1;
+    string username = 2;
+    int64 s_id = 3;
+}
+
+message Hops
+{
+    int64 s_id = 1;
+    int32 hops = 2;
+    int32 port = 3;
+}
