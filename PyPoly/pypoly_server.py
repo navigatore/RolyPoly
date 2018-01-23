@@ -1,5 +1,4 @@
 # TODO:
-# Przesyłanie listy użytkowników do klienta
 # Usuwanie użytkowników
 
 
@@ -27,22 +26,22 @@ class SocketInfo:
 
 
 class ClientInfo:
-    def __init__(self, uid, name, socketinfo):
+    def __init__(self, uid, name, socketinfo, last_alive):
         self.uid = uid
         self.name = name
         self.socketinfo = socketinfo
-        self.last_alive = millitime()
+        self.last_alive = last_alive
 
     def __repr__(self):
         return self.name + '<id: ' + str(self.uid) + '>'
 
 
 class SystemUserInfo:
-    def __init__(self, uid, name, sid):
+    def __init__(self, uid, name, sid, last_alive):
         self.uid = uid
         self.name = name
         self.sid = sid
-        self.last_alive = millitime()
+        self.last_alive = last_alive
 
     def __str__(self):
         return self.name + ' <id: ' + str(self.uid) + ' @ ' + str(self.sid) + '>'
@@ -73,6 +72,7 @@ CLIENT_MAX_ALIVE_TIME = 10
 SERV_MAX_ALIVE_TIME = 20
 USERS_DISCOVERY_TIME = 2
 USERS_MAX_ALIVE_TIME = 8
+UDP_MAXLEN = 1024
 
 
 q = queue.Queue()
@@ -99,7 +99,7 @@ def listener(port):
     s.bind(('', port))
 
     while True:
-        data, client_addr = s.recvfrom(200)
+        data, client_addr = s.recvfrom(UDP_MAXLEN)
         msg = rolypoly_pb2.GenericMessage()
         msg.ParseFromString(data)
         if msg.type == 'EOF':
@@ -117,13 +117,17 @@ def listener(port):
         elif msg.type == 'Pong':
             q.put(Event('CLIENT_ALIVE', content=msg.u_id))
         elif msg.type == 'NewSystemUserInfo':
-            pass # q.put(Event('NEW_SYSTEM_USER', content=parse_new_system_user_info(msg.new_system_user_info)))
+            q.put(Event('NEW_SYSTEM_USER', content=parse_new_system_user_info(msg.new_system_user_info)))
+        elif msg.type == 'DelSystemUserInfo':
+            q.put(Event('DEL_SYSTEM_USER', content=msg.u_id))
         elif msg.type == 'CountHops':
             q.put(Event('RETURN_HOPS', content=(SocketInfo(client_addr[0], msg.hops.port), msg.hops.s_id)))
         elif msg.type == 'HopsFrom':
             q.put(Event('UPDATE_HOPS', content=(SocketInfo(client_addr[0], msg.hops.port), msg.hops.s_id, msg.hops.hops)))
         elif msg.type == 'Message':
             q.put(Event('SEND_MESSAGE', content=(msg.message.sender_id, msg.message.receiver_id, msg.message.text)))
+        elif msg.type == 'GetUserList':
+            q.put(Event('SEND_USER_LIST', content=SocketInfo(*client_addr)))
 
     s.close()
     print('Listener stopped')
@@ -140,7 +144,7 @@ def parse_known_servers(ks_proto):
 def parse_known_users(ku_proto):
     ku = {}
     for i in range(len(ku_proto)):
-        suinfo = SystemUserInfo(ku_proto[i].u_id, ku_proto[i].username, ku_proto[i].s_id)
+        suinfo = SystemUserInfo(ku_proto[i].u_id, ku_proto[i].username, ku_proto[i].s_id, ku_proto[i].last_alive)
         ku[suinfo.uid] = suinfo
 
     return ku
@@ -148,11 +152,11 @@ def parse_known_users(ku_proto):
 
 def parse_connect_request(addr, port, cr_proto):
     socketinfo = SocketInfo(addr, port)
-    return ClientInfo(cr_proto.u_id, cr_proto.username, socketinfo)
+    return ClientInfo(cr_proto.u_id, cr_proto.username, socketinfo, millitime())
 
 
 def parse_new_system_user_info(info):
-    return SystemUserInfo(info.u_id, info.username, info.s_id)
+    return SystemUserInfo(info.u_id, info.username, info.s_id, millitime())
 
 
 ########################################################################################################################
@@ -177,11 +181,8 @@ def process():
             break
         # print(ev)
         if ev.ev_type == 'SERVER_DISCOVERY':
-            # print('KNOWN SERVERS:', known_servers)
             server_discovery()
         elif ev.ev_type == 'CLIENT_DISCOVERY':
-            # print('KNOWN CLIENTS:', my_clients)
-            # print('KNOWN SYSTEM USERS:', system_users)
             client_discovery()
         elif ev.ev_type == 'USER_DISCOVERY':
             user_discovery()
@@ -205,12 +206,16 @@ def process():
             client_alive(ev.content)
         elif ev.ev_type == 'NEW_SYSTEM_USER':
             new_system_user(ev.content)
+        elif ev.ev_type == 'DEL_SYSTEM_USER':
+            del_system_user(ev.content)
         elif ev.ev_type == 'RETURN_HOPS':
             return_hops(*ev.content)
         elif ev.ev_type == 'UPDATE_HOPS':
             update_hops(*ev.content)
         elif ev.ev_type == 'SEND_MESSAGE':
             send_msg(*ev.content)
+        elif ev.ev_type == 'SEND_USER_LIST':
+            send_user_list(ev.content)
         else:
             raise NotImplementedError('This kind of event is not supported: ' + ev.ev_type)
         q.task_done()
@@ -294,7 +299,7 @@ def merge_known_users(other_users):
         if other_users[uid].sid != my_id:
             if uid not in system_users:
                 system_users[uid] = other_users[uid]
-                print('# User', uid, ' connected #')
+                print('# User', system_users[uid].name, '<id: ' + str(uid) + '>', 'connected #')
             else:
                 system_users[uid].last_alive = max(system_users[uid].last_alive, other_users[uid].last_alive)
 
@@ -314,9 +319,14 @@ def remove_inactive_clients():
     curtime = millitime()
     for cid in list(my_clients):
         if (curtime - my_clients[cid].last_alive) > CLIENT_MAX_ALIVE_TIME * 1000:
+            print('# Client', system_users[cid].name, '<id: ' + str(cid) + '>', 'disconnected #')
             del my_clients[cid]
             del system_users[cid]
-            print('# Client', cid, 'disconnected #')
+            msg = rolypoly_pb2.GenericMessage()
+            msg.type = 'DelSystemUserInfo'
+            msg.u_id = cid
+            for nb in nbs:
+                proc_sock.sendto(msg.SerializeToString(), (nb.addr, nb.port))
     threading.Timer(CLIENT_DISCOVERY_TIME, put_event, args=[Event('REMOVE_INACTIVE_CLIENTS')]).start()
 
 
@@ -327,8 +337,8 @@ def remove_inactive_users():
 
     for uid in list(system_users):
         if (curtime - system_users[uid].last_alive) > USERS_MAX_ALIVE_TIME * 1000:
+            print('# User', system_users[uid].name, '<id: ' + str(uid) + '>', 'disconnected #')
             del system_users[uid]
-            print('# User', uid, 'disconnected #')
     threading.Timer(USERS_DISCOVERY_TIME, put_event, args=[Event('REMOVE_INACTIVE_USERS')]).start()
 
 
@@ -336,7 +346,7 @@ def add_new_client(clientinfo):
     uid = clientinfo.uid
     name = clientinfo.name
     my_clients[clientinfo.uid] = clientinfo
-    system_users[clientinfo.uid] = SystemUserInfo(uid, name, my_id)
+    system_users[clientinfo.uid] = SystemUserInfo(uid, name, my_id, clientinfo.last_alive)
 
     msg = rolypoly_pb2.GenericMessage()
     msg.type = 'Connected'
@@ -367,29 +377,41 @@ def new_system_user(info):
         msg.new_system_user_info.s_id = info.sid
         for nb in nbs:
             proc_sock.sendto(msg.SerializeToString(), (nb.addr, nb.port))
-        print('# User', info.name, '<id: ' + str(info.uid) + '> connected #')
+        print('# User', system_users[info.uid].name, '<id: ' + str(info.uid) + '>', 'connected #')
+
+
+def del_system_user(uid):
+    if uid in system_users:
+        print('# User', system_users[uid].name, '<id: ' + str(uid) + '> disconnected #')
+        del system_users[uid]
+        msg = rolypoly_pb2.GenericMessage()
+        msg.type = 'DelSystemUserInfo'
+        msg.u_id = uid
+        for nb in nbs:
+            proc_sock.sendto(msg.SerializeToString(), (nb.addr, nb.port))
 
 
 def send_msg(sender_id, receiver_id, text):
-    if receiver_id in my_clients:
-        msg = rolypoly_pb2.GenericMessage()
-        msg.type = 'Message'
-        msg.message.sender_id = sender_id
-        msg.message.receiver_id = receiver_id
-        msg.message.text = text
-        si = my_clients[receiver_id].socketinfo
-        proc_sock.sendto(msg.SerializeToString(), (si.addr, si.port))
-    elif system_users[receiver_id].sid not in rout_table:
-        find_route(system_users[receiver_id].sid)
-        threading.Timer(MSG_RESEND_TIME, put_event, args=[Event('SEND_MESSAGE', content=(sender_id, receiver_id, text))]).start()
-    else:
-        msg = rolypoly_pb2.GenericMessage()
-        msg.type = 'Message'
-        msg.message.sender_id = sender_id
-        msg.message.receiver_id = receiver_id
-        msg.message.text = text
-        si = rout_table[system_users[receiver_id].sid][1]
-        proc_sock.sendto(msg.SerializeToString(), (si.addr, si.port))
+    if receiver_id in system_users:
+        if receiver_id in my_clients:
+            msg = rolypoly_pb2.GenericMessage()
+            msg.type = 'Message'
+            msg.message.sender_id = sender_id
+            msg.message.receiver_id = receiver_id
+            msg.message.text = text
+            si = my_clients[receiver_id].socketinfo
+            proc_sock.sendto(msg.SerializeToString(), (si.addr, si.port))
+        elif system_users[receiver_id].sid not in rout_table:
+            find_route(system_users[receiver_id].sid)
+            threading.Timer(MSG_RESEND_TIME, put_event, args=[Event('SEND_MESSAGE', content=(sender_id, receiver_id, text))]).start()
+        else:
+            msg = rolypoly_pb2.GenericMessage()
+            msg.type = 'Message'
+            msg.message.sender_id = sender_id
+            msg.message.receiver_id = receiver_id
+            msg.message.text = text
+            si = rout_table[system_users[receiver_id].sid][1]
+            proc_sock.sendto(msg.SerializeToString(), (si.addr, si.port))
 
 
 def find_route(sid):
@@ -431,6 +453,17 @@ def update_hops(socketinfo, sid, hops):
 def clear_rout_table():
     global rout_table
     rout_table = {my_id: (0, SocketInfo('127.0.0.1', my_port))}
+
+
+def send_user_list(socketinfo):
+    msg = rolypoly_pb2.GenericMessage()
+    msg.type = 'UserList'
+    for i, uid in enumerate(system_users):
+        u = system_users[uid]
+        msg.userlist.users.add()
+        msg.userlist.users[i].s_id = uid
+        msg.userlist.users[i].username = u.name
+    proc_sock.sendto(msg.SerializeToString(), (socketinfo.addr, socketinfo.port))
 
 
 ########################################################################################################################
